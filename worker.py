@@ -468,22 +468,51 @@ async def execute_download_upload(client, chat_id, task_id, task_data, ui_msg):
                 if i in custom_renames and not os.path.splitext(filename)[1]: filename += orig_ext
 
                 # 1. DOWNLOAD
-                dl_opts = {"select-file": str(i), "dir": download_dir, "allow-overwrite": "true"}
+                # --- FIXED: Added "seed-time": "0" to forcefully prevent seeding states ---
+                dl_opts = {"select-file": str(i), "dir": download_dir, "allow-overwrite": "true", "seed-time": "0"}
                 active_dl, dl_path = None, None
+                
                 try:
                     active_dl = aria2_api.add_torrent(torrent_file_path, options=dl_opts)
                     start_time, last_edit_time = time.time(), [0]
-                    while active_dl.status not in ["complete", "error", "removed"]:
+                    
+                    while True:
                         if cancel_flags.get(task_id):
                             aria2_api.remove([active_dl], force=True, files=False)
                             break
-                        await asyncio.sleep(2)
-                        active_dl.update()
+                            
+                        try:
+                            active_dl.update()
+                        except:
+                            break # Exits if task is suddenly missing
+                            
+                        # --- FIXED: Break immediately if completed, removed, error, or mistakenly seeding ---
+                        if active_dl.status in ["complete", "error", "removed", "seeding"]:
+                            break
+                            
+                        # --- FIXED: Safety break if exactly 100% is downloaded ---
+                        if active_dl.total_length > 0 and active_dl.completed_length >= active_dl.total_length:
+                            break
+
                         if active_dl.total_length > 0:
-                            await update_ui(ui_msg, "📥 Torrent Download", filename, active_dl.completed_length, active_dl.total_length, start_time, last_edit_time, task_id, extra_lines=[f"<b>Speed:</b> {format_bytes(active_dl.download_speed)}/s"])
+                            # (Removed extra_lines for speed to avoid "0 B/s" issue. Built-in avg speed is better)
+                            await update_ui(ui_msg, "📥 Torrent Download", filename, active_dl.completed_length, active_dl.total_length, start_time, last_edit_time, task_id)
+                            
+                        await asyncio.sleep(1.5)
+                        
                     if cancel_flags.get(task_id): break
+                    
+                    # --- FIXED: Give Aria2 a moment to flush files, then properly identify the file using its index ---
+                    await asyncio.sleep(1)
+                    try: active_dl.update() 
+                    except: pass
+                    
                     for f in active_dl.files:
-                        if getattr(f, "selected", False) and os.path.exists(str(f.path)): dl_path = str(f.path); break
+                        if str(f.index) == str(i):
+                            if os.path.exists(str(f.path)): 
+                                dl_path = str(f.path)
+                            break
+                            
                 finally:
                     if active_dl:
                         with contextlib.suppress(Exception): aria2_api.remove([active_dl], force=True, files=False)
@@ -631,9 +660,25 @@ async def handle_magnet(client, message):
         with contextlib.suppress(Exception): aria2_api.remove([meta_dl], force=True, files=False)
         
         file_list_html = build_file_tree(files, True)
+        file_list_txt = build_file_tree(files, False)
+        
         prompt_caption = f"✅ <b>ගොනුව හඳුනාගත්තා! (Mode: {batch_states[user_id]['mode'].upper()})</b>\n\n👉 <b>මෙම පණිවිඩයට Reply කරමින්</b> අවශ්‍ය file අංක දෙන්න (උදා: 1,2 ෙහෝ all).\n✏️ Rename: <code>[1] /rename NewName</code>"
         
-        prompt_msg = await message.reply_text(f"<b>Files:</b>\n{file_list_html}\n\n{prompt_caption}", parse_mode=enums.ParseMode.HTML)
+        if len(file_list_html) > 3500:
+            txt_path = os.path.join(temp_dir, "file_list.txt")
+            with open(txt_path, "w", encoding="utf-8") as f:
+                f.write(file_list_txt)
+            prompt_msg = await message.reply_document(
+                document=txt_path, 
+                caption=f"⚠️ <i>Torrent එකේ file list එක දිගු වැඩියි. ඒක නිසා txt file එකක් විදිහට එව්වා.</i>\n\n{prompt_caption}", 
+                parse_mode=enums.ParseMode.HTML
+            )
+        else:
+            prompt_msg = await message.reply_text(
+                f"<b>Files:</b>\n{file_list_html}\n\n{prompt_caption}", 
+                parse_mode=enums.ParseMode.HTML
+            )
+        
         task_id = str(prompt_msg.id)
         
         markup = InlineKeyboardMarkup([[InlineKeyboardButton("⏭ Next Torrent (All Files)", callback_data=f"b_next_{task_id}")], [InlineKeyboardButton("▶️ Start Batch (All Files)", callback_data=f"b_start_{task_id}")], [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{task_id}")]])
@@ -763,8 +808,21 @@ async def heartbeat_loop(ws):
 async def main():
     global app, upload_client, aria2_api
     
+    # --- FIXED: Added --seed-time=0 to the root aria2 process to completely kill Seeding ---
+    subprocess.Popen([
+        "aria2c", 
+        "--enable-rpc=true", 
+        "--rpc-listen-all=false", 
+        "--rpc-listen-port=6800", 
+        "--daemon=true",
+        "--seed-time=0",
+        "--bt-seed-unverified=false",
+        "--max-upload-limit=1K"
+    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    
+    # Wait for Aria2 to initialize
+    await asyncio.sleep(2)
     aria2_api = aria2p.API(aria2p.Client(host="http://localhost", port=6800, secret=""))
-    subprocess.Popen(["aria2c", "--enable-rpc=true", "--rpc-listen-all=false", "--rpc-listen-port=6800", "--daemon=true"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     
     key = str(random.randint(100000, 999999))
     print("="*40)
